@@ -1,11 +1,11 @@
-use log::warn;
+use tokio::sync::Mutex;
 
 use crate::{
-    exchange::{Exchange, ExchangeName, ExchangeType},
+    exchange::{Exchange, ExchangeName},
     message::{Message, MessageId},
     queue::{Queue, QueueName},
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 pub type BrokerResult<T> = Result<T, Error>;
 
@@ -21,10 +21,9 @@ pub enum Error {
     ExchangeNotFound(ExchangeName),
 }
 
-#[derive(Clone)]
 pub struct Broker {
-    queues: HashMap<QueueName, Queue>,
-    exchanges: HashMap<ExchangeName, Exchange>,
+    queues: HashMap<QueueName, Arc<Mutex<Queue>>>,
+    exchanges: HashMap<ExchangeName, Arc<Mutex<Exchange>>>,
 }
 
 impl Broker {
@@ -39,31 +38,36 @@ impl Broker {
         Ok(())
     }
 
-    pub async fn declare_queue(&mut self, name: QueueName) {
+    pub fn declare_queue(&mut self, name: QueueName) {
         self.queues
             .entry(name.clone())
-            .or_insert_with(|| Queue::new(name));
+            .or_insert_with(|| Arc::new(Mutex::new(Queue::new(name))));
     }
 
-    pub fn declare_exchange(&mut self, name: ExchangeName, exchange_type: ExchangeType) {
-        self.exchanges
-            .insert(name.clone(), Exchange::new(name, exchange_type));
+    pub fn declare_exchange(&mut self, name: ExchangeName) {
+        // self.exchanges.insert(
+        //     name.clone(),
+        //     Arc::new(Mutex::new(Exchange::new(name, exchange_type))),
+        // );
+        todo!()
     }
 
-    pub fn bind_queue(
+    pub async fn bind_queue(
         &mut self,
         exchange_name: &ExchangeName,
-        queue_name: QueueName,
+        queue_name: &QueueName,
     ) -> BrokerResult<()> {
-        match self.exchanges.get_mut(exchange_name) {
-            Some(ex) => match self.queues.get(&queue_name) {
-                Some(_) => {
-                    ex.bind_queue(queue_name);
-                    Ok(())
-                }
-                None => Err(Error::QueueNotFound(queue_name.to_owned())),
-            },
-            None => Err(Error::ExchangeNotFound(exchange_name.clone())),
+        match (
+            self.exchanges.get_mut(exchange_name),
+            self.queues.get(&queue_name),
+        ) {
+            (Some(ex), Some(q)) => {
+                let mut ex_guard = ex.lock().await;
+                ex_guard.bind_queue(queue_name.clone(), Arc::clone(q));
+                Ok(())
+            }
+            (None, _) => Err(Error::ExchangeNotFound(exchange_name.clone())),
+            (_, None) => Err(Error::QueueNotFound(queue_name.to_owned())),
         }
     }
 
@@ -73,14 +77,8 @@ impl Broker {
         message: Message,
     ) -> BrokerResult<()> {
         if let Some(ex) = self.exchanges.get(exchange_name) {
-            for queue in ex.bindings() {
-                if let Some(queue) = self.queues.get(queue) {
-                    queue.publish(message.clone()).await;
-                } else {
-                    warn!("Queue not found");
-                }
-            }
-            Ok(())
+            let mut ex_guard = ex.lock().await;
+            ex_guard.publish(message.clone()).await
         } else {
             Err(Error::ExchangeNotFound(exchange_name.to_owned()))
         }
@@ -92,20 +90,25 @@ impl Broker {
         fetch_size: u64,
     ) -> BrokerResult<Vec<Message>> {
         match self.queues.get(queue_name) {
-            Some(queue) => Ok(queue.consume(fetch_size).await),
+            Some(queue) => {
+                let mut queue_guard = queue.lock().await;
+                Ok(queue_guard.consume(fetch_size).await)
+            }
             None => Err(Error::QueueNotFound(queue_name.to_owned())),
         }
     }
 
     pub async fn ack(&self, queue_name: &QueueName, message_id: &MessageId) {
         if let Some(q) = self.queues.get(queue_name) {
-            q.ack(message_id).await;
+            let mut q_guard = q.lock().await;
+            q_guard.ack(message_id).await;
         }
     }
 
     pub async fn nack(&self, queue_name: &QueueName, message_id: &MessageId) {
         if let Some(q) = self.queues.get(queue_name) {
-            q.nack(message_id).await;
+            let mut q_guard = q.lock().await;
+            q_guard.nack(message_id).await;
         }
     }
 }
@@ -117,46 +120,27 @@ mod tests {
     use rand::{rngs::StdRng, Rng, SeedableRng};
     use tokio::time::sleep;
 
-    use crate::message::{self, Message, MessageId};
+    use crate::{
+        message::{self, Message, MessageId},
+    };
 
     use super::Broker;
 
     #[tokio::test]
     async fn test_broker() {
+        dotenvy::dotenv().unwrap();
+        env_logger::init();
+
         let mut broker = Broker::new();
+        broker.declare_queue("fila1".try_into().unwrap());
+        broker.declare_exchange("exchange1".try_into().unwrap());
+        broker
+            .bind_queue(
+                &"exchange1".try_into().unwrap(),
+                &"fila1".try_into().unwrap(),
+            )
+            .await;
 
-        broker.declare_queue("fila1".try_into().unwrap()).await;
-
-        let prod = broker.clone();
-        tokio::spawn(async move {
-            for i in 0..1000 {
-                // let mut rng = {
-                //     let mut rng = rand::rng();
-                //     StdRng::from_rng(&mut rng)
-                // };
-                // let millis = rng.gen_range(1..100);
-                tokio::time::sleep(std::time::Duration::from_millis(3)).await;
-                println!("publish message {i}");
-                prod.publish(
-                    &"fila1".try_into().unwrap(),
-                    Message::new(MessageId::new(), ""),
-                )
-                .await
-                .unwrap();
-            }
-        });
-
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let messages = broker
-                    .consume_from_queue(&"fila1".try_into().unwrap(), 100)
-                    .await
-                    .unwrap();
-                println!("Consuming {}", messages.len());
-            }
-        })
-        .await
-        .unwrap();
+        sleep(Duration::from_secs(10)).await
     }
 }
