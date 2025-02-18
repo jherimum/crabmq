@@ -1,11 +1,15 @@
+use commands::{BrokerCommand, BrokerResponse, IntoBrokerCommand};
+use handlers::{handle_ack_message, handle_publish_message};
 use tokio::sync::Mutex;
-
 use crate::{
     exchange::{Exchange, ExchangeName},
     message::{Message, MessageId},
     queue::{Queue, QueueName},
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, future::Future, sync::Arc};
+
+pub mod commands;
+pub mod handlers;
 
 pub type BrokerResult<T> = Result<T, Error>;
 
@@ -19,18 +23,37 @@ pub enum Error {
 
     #[error("Exchange {0} does no exists")]
     ExchangeNotFound(ExchangeName),
+
+    #[error("Failed to send message")]
+    RecvError(#[from] tokio::sync::oneshot::error::RecvError),
+
+    #[error("Failed to send message")]
+    SendError(#[from] tokio::sync::mpsc::error::SendError<BrokerCommand>),
 }
 
+type QueueMap = HashMap<QueueName, Arc<Mutex<Queue>>>;
+type ExchangeMap = HashMap<ExchangeName, Arc<Mutex<Exchange>>>;
+type BrokerCommandSender = tokio::sync::mpsc::Sender<BrokerCommand>;
+type BrokerCommandReceiver = tokio::sync::mpsc::Receiver<BrokerCommand>;
+
 pub struct Broker {
-    queues: HashMap<QueueName, Arc<Mutex<Queue>>>,
-    exchanges: HashMap<ExchangeName, Arc<Mutex<Exchange>>>,
+    queues: QueueMap,
+    exchanges: ExchangeMap,
+    sender: BrokerCommandSender,
 }
 
 impl Broker {
     pub fn new() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+        let queues = QueueMap::default();
+        let exchanges = ExchangeMap::default();
+
+        spawn_command_executor(rx, exchanges.clone(), queues.clone());
+
         Broker {
-            queues: Default::default(),
-            exchanges: Default::default(),
+            queues,
+            exchanges,
+            sender: tx,
         }
     }
 
@@ -113,34 +136,53 @@ impl Broker {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
+pub trait BrokerCommandBus {
+    fn send<C>(
+        &self,
+        command: C,
+    ) -> impl Future<Output = BrokerResult<BrokerResponse<C::Output>>>
+    where
+        C: IntoBrokerCommand;
+}
 
-    use rand::{rngs::StdRng, Rng, SeedableRng};
-    use tokio::time::sleep;
-
-    use crate::{
-        message::{self, Message, MessageId},
-    };
-
-    use super::Broker;
-
-    #[tokio::test]
-    async fn test_broker() {
-        dotenvy::dotenv().unwrap();
-        env_logger::init();
-
-        let mut broker = Broker::new();
-        broker.declare_queue("fila1".try_into().unwrap());
-        broker.declare_exchange("exchange1".try_into().unwrap());
-        broker
-            .bind_queue(
-                &"exchange1".try_into().unwrap(),
-                &"fila1".try_into().unwrap(),
-            )
-            .await;
-
-        sleep(Duration::from_secs(10)).await
+impl BrokerCommandBus for &Broker {
+    async fn send<C>(
+        &self,
+        command: C,
+    ) -> BrokerResult<BrokerResponse<C::Output>>
+    where
+        C: IntoBrokerCommand,
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender.send(command.into_command(tx)).await?;
+        rx.await?
     }
+}
+
+fn spawn_command_executor(
+    mut rx: BrokerCommandReceiver,
+    exchanges: ExchangeMap,
+    queues: QueueMap,
+) {
+    tokio::spawn(async move {
+        while let Some(command) = rx.recv().await {
+            match command {
+                BrokerCommand::PublishMesage(envelop) => {
+                    let response =
+                        handle_publish_message(envelop.request, &exchanges)
+                            .await;
+                    let _ = envelop
+                        .sender
+                        .send(response.map(|r| BrokerResponse { response: r }));
+                }
+                BrokerCommand::AckMessage(envelop) => {
+                    let response =
+                        handle_ack_message(envelop.request, &queues).await;
+                    let _ = envelop
+                        .sender
+                        .send(response.map(|r| BrokerResponse { response: r }));
+                }
+            }
+        }
+    });
 }

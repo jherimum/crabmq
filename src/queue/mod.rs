@@ -15,6 +15,8 @@ use tokio::{
     time::{sleep, Instant},
 };
 
+pub struct QueueOptions {}
+
 #[derive(Clone, Hash, PartialEq, Eq, Debug)]
 pub struct QueueName(String);
 

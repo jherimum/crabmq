@@ -2,7 +2,7 @@ use std::{thread::sleep, time::Duration};
 
 use anyhow::Result;
 use crabmq::broker::Broker;
-use log::{debug, info};
+use log::{debug};
 
 #[tokio::main]
 async fn main() -> Result<()> {

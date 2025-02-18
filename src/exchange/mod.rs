@@ -13,6 +13,8 @@ pub mod wal;
 
 type Bindings = HashMap<QueueName, Arc<Mutex<Queue>>>;
 
+pub struct ExchangeOptions {}
+
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct ExchangeName(String);
 
