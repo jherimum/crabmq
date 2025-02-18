@@ -2,21 +2,21 @@ use std::{thread::sleep, time::Duration};
 
 use anyhow::Result;
 use crabmq::broker::Broker;
-use log::{debug};
+use tokio::select;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv()?;
     env_logger::init();
 
-    debug!("Starting broker");
-
     let broker = Broker::new();
-    tokio::spawn(async move {
-        broker.start().await;
-    });
+    let (j, bus) = broker.run();
 
-    sleep(Duration::from_secs(1));
+    select! {
+        _ = j => {
+            log::info!("Broker stopped");
+        }
+    }
 
     Ok(())
 }

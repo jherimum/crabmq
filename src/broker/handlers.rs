@@ -9,16 +9,3 @@ pub async fn handle_ack_message(
 ) -> BrokerResult<()> {
     todo!()
 }
-
-pub async fn handle_publish_message(
-    request: PublishMessageCommand,
-    exchanges: &ExchangeMap,
-) -> BrokerResult<()> {
-    exchanges
-        .get(&request.exchange_name)
-        .unwrap()
-        .lock()
-        .await
-        .publish(request.message)
-        .await
-}

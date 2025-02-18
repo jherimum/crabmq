@@ -1,15 +1,28 @@
-use commands::{BrokerCommand, BrokerResponse, IntoBrokerCommand};
-use handlers::{handle_ack_message, handle_publish_message};
-use tokio::sync::Mutex;
+use commands::{
+    BrokerCommand, BrokerResponse, IntoBrokerCommand, PublishMessageCommand,
+};
+use handlers::handle_ack_message;
+use log::info;
+use tokio::{
+    sync::{mpsc, oneshot, Mutex},
+    task::JoinHandle,
+};
 use crate::{
     exchange::{Exchange, ExchangeName},
     message::{Message, MessageId},
     queue::{Queue, QueueName},
 };
-use std::{collections::HashMap, future::Future, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 pub mod commands;
 pub mod handlers;
+
+type QueueMap = HashMap<QueueName, Arc<Mutex<Queue>>>;
+type ExchangeMap = HashMap<ExchangeName, Arc<Mutex<Exchange>>>;
+type BrokerCommandSender = tokio::sync::mpsc::Sender<BrokerCommand>;
+
+type AsyncCommandSender<T> =
+    tokio::sync::oneshot::Sender<Result<BrokerResponse<T>, Error>>;
 
 pub type BrokerResult<T> = Result<T, Error>;
 
@@ -25,40 +38,87 @@ pub enum Error {
     ExchangeNotFound(ExchangeName),
 
     #[error("Failed to send message")]
-    RecvError(#[from] tokio::sync::oneshot::error::RecvError),
+    RecvError(#[from] oneshot::error::RecvError),
 
     #[error("Failed to send message")]
-    SendError(#[from] tokio::sync::mpsc::error::SendError<BrokerCommand>),
+    SendError(#[from] mpsc::error::SendError<BrokerCommand>),
 }
 
-type QueueMap = HashMap<QueueName, Arc<Mutex<Queue>>>;
-type ExchangeMap = HashMap<ExchangeName, Arc<Mutex<Exchange>>>;
-type BrokerCommandSender = tokio::sync::mpsc::Sender<BrokerCommand>;
-type BrokerCommandReceiver = tokio::sync::mpsc::Receiver<BrokerCommand>;
+pub struct BrokerCommandBus {
+    sender: BrokerCommandSender,
+}
+
+impl BrokerCommandBus {
+    pub async fn send<C>(
+        &self,
+        command: C,
+    ) -> BrokerResult<BrokerResponse<C::Output>>
+    where
+        C: IntoBrokerCommand,
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender.send(command.into_command(tx)).await?;
+        rx.await?
+    }
+}
 
 pub struct Broker {
     queues: QueueMap,
     exchanges: ExchangeMap,
-    sender: BrokerCommandSender,
 }
 
 impl Broker {
     pub fn new() -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
-        let queues = QueueMap::default();
-        let exchanges = ExchangeMap::default();
-
-        spawn_command_executor(rx, exchanges.clone(), queues.clone());
-
         Broker {
-            queues,
-            exchanges,
-            sender: tx,
+            queues: QueueMap::default(),
+            exchanges: ExchangeMap::default(),
         }
     }
 
-    pub async fn start(&self) -> BrokerResult<()> {
-        Ok(())
+    pub async fn handle_publish_message(
+        &self,
+        request: PublishMessageCommand,
+        tx: AsyncCommandSender<()>,
+    ) {
+        let response = self
+            .exchanges
+            .get(&request.exchange_name)
+            .unwrap()
+            .lock()
+            .await
+            .publish(request.message)
+            .await;
+
+        tx.send(response.map(|response| BrokerResponse { response }));
+    }
+
+    pub fn run(self) -> (JoinHandle<()>, BrokerCommandBus) {
+        info!("Starting broker...");
+        let (tx, mut rx) = mpsc::channel(100);
+
+        let join = tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                match command {
+                    BrokerCommand::PublishMesage(envelop) => {
+                        self.handle_publish_message(
+                            envelop.request,
+                            envelop.sender,
+                        )
+                        .await;
+                    }
+                    BrokerCommand::AckMessage(envelop) => {
+                        let response =
+                            handle_ack_message(envelop.request, &self.queues)
+                                .await;
+                        let _ = envelop.sender.send(
+                            response.map(|r| BrokerResponse { response: r }),
+                        );
+                    }
+                }
+            }
+        });
+
+        (join, BrokerCommandBus { sender: tx })
     }
 
     pub fn declare_queue(&mut self, name: QueueName) {
@@ -134,55 +194,4 @@ impl Broker {
             q_guard.nack(message_id).await;
         }
     }
-}
-
-pub trait BrokerCommandBus {
-    fn send<C>(
-        &self,
-        command: C,
-    ) -> impl Future<Output = BrokerResult<BrokerResponse<C::Output>>>
-    where
-        C: IntoBrokerCommand;
-}
-
-impl BrokerCommandBus for &Broker {
-    async fn send<C>(
-        &self,
-        command: C,
-    ) -> BrokerResult<BrokerResponse<C::Output>>
-    where
-        C: IntoBrokerCommand,
-    {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.sender.send(command.into_command(tx)).await?;
-        rx.await?
-    }
-}
-
-fn spawn_command_executor(
-    mut rx: BrokerCommandReceiver,
-    exchanges: ExchangeMap,
-    queues: QueueMap,
-) {
-    tokio::spawn(async move {
-        while let Some(command) = rx.recv().await {
-            match command {
-                BrokerCommand::PublishMesage(envelop) => {
-                    let response =
-                        handle_publish_message(envelop.request, &exchanges)
-                            .await;
-                    let _ = envelop
-                        .sender
-                        .send(response.map(|r| BrokerResponse { response: r }));
-                }
-                BrokerCommand::AckMessage(envelop) => {
-                    let response =
-                        handle_ack_message(envelop.request, &queues).await;
-                    let _ = envelop
-                        .sender
-                        .send(response.map(|r| BrokerResponse { response: r }));
-                }
-            }
-        }
-    });
 }
