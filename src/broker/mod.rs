@@ -44,6 +44,7 @@ pub enum Error {
     SendError(#[from] mpsc::error::SendError<BrokerCommand>),
 }
 
+#[derive(Debug, Clone)]
 pub struct BrokerCommandBus {
     sender: BrokerCommandSender,
 }
@@ -75,7 +76,7 @@ impl Broker {
         }
     }
 
-    pub async fn handle_publish_message(
+    async fn handle_publish_message(
         &self,
         request: PublishMessageCommand,
         tx: AsyncCommandSender<()>,
@@ -193,5 +194,25 @@ impl Broker {
             let mut q_guard = q.lock().await;
             q_guard.nack(message_id).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::message::{Message, MessageId};
+
+    use super::Broker;
+
+    #[tokio::test]
+    async fn test() {
+        let broker = Broker::new();
+
+        broker
+            .publish(
+                &"name".try_into().unwrap(),
+                Message::new(MessageId::new(), "Hello".as_bytes(), None),
+            )
+            .await
+            .unwrap();
     }
 }
