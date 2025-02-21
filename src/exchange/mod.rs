@@ -1,17 +1,15 @@
 use crate::broker::Error;
 use crate::message::Message;
 use crate::queue::{Queue, QueueName};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use wal::ExhangeWAL;
-
-pub mod wal;
 
 type Bindings = HashMap<QueueName, Arc<Mutex<Queue>>>;
+type Messages = Arc<Mutex<VecDeque<Message>>>;
 
 pub struct ExchangeOptions {}
 
@@ -36,20 +34,27 @@ impl Display for ExchangeName {
 pub struct Exchange {
     name: ExchangeName,
     bindings: Bindings,
-    wal: ExhangeWAL,
+    messages: Messages,
 }
 
 impl Exchange {
-    pub async fn new(name: ExchangeName, wal: ExhangeWAL) -> Self {
-        let bindings: Bindings = Default::default();
-
-        //publish_to_bindings(bindings.clone(), wal.clone());
+    pub fn new(name: ExchangeName) -> Self {
+        let bindings: Bindings = Bindings::default();
+        let messages = Messages::default();
 
         Self {
             name: name.clone(),
             bindings,
-            wal,
+            messages,
         }
+    }
+
+    pub fn start(&self) {
+        publish_to_bindings(self.bindings.clone(), self.messages.clone());
+    }
+
+    pub fn name(&self) -> &ExchangeName {
+        &self.name
     }
 
     pub fn bind_queue(&mut self, name: QueueName, queue: Arc<Mutex<Queue>>) {
@@ -65,21 +70,26 @@ impl Exchange {
     }
 
     pub async fn publish(&mut self, message: Message) -> Result<(), Error> {
-        //self.wal.lock().await.write(&message).await.unwrap();
+        //persist to WAL
+        self.messages.lock().await.push_back(message);
         Ok(())
     }
 }
 
-// fn publish_to_bindings(bindings: Bindings, wal: Arc<Mutex<ExhangeWAL>>) {
-//     tokio::spawn(async move {
-//         loop {
-//             let messages = wal.lock().await.read().await.unwrap();
-//             for queue in bindings.values() {
-//                 let mut queue = queue.lock().await;
-//                 queue.publish_many(messages.clone()).await;
-//             }
+fn publish_to_bindings(bindings: Bindings, messages: Messages) {
+    tokio::spawn(async move {
+        loop {
+            let mut messages = messages.lock().await;
 
-//             sleep(Duration::from_secs(1)).await;
-//         }
-//     });
-// }
+            if !messages.is_empty() {
+                for queue in bindings.values() {
+                    let mut queue = queue.lock().await;
+                    queue.publish_all(messages.clone()).await;
+                }
+            }
+            messages.clear();
+
+            sleep(Duration::from_secs(1)).await;
+        }
+    });
+}

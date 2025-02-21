@@ -2,6 +2,7 @@ use crate::{
     broker::Error,
     message::{Message, MessageId},
 };
+use chrono::Utc;
 use log::info;
 use std::{
     cmp::{Ordering, Reverse},
@@ -10,10 +11,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{
-    sync::Mutex,
-    time::{sleep, Instant},
-};
+use tokio::{sync::Mutex, time::sleep};
 
 pub struct QueueOptions {}
 
@@ -34,12 +32,16 @@ impl TryFrom<&str> for QueueName {
     }
 }
 
+type MessageQueue = Arc<Mutex<VecDeque<Message>>>;
+type PendingAcks = HashMap<MessageId, Message>;
+type DelayedMessages = Arc<Mutex<BinaryHeap<DelayedMessage>>>;
+
 #[derive(Clone, Debug)]
 pub struct Queue {
     name: QueueName,
-    messages: Arc<Mutex<VecDeque<Message>>>,
-    pending_acks: HashMap<MessageId, Message>,
-    delayed_messages: Arc<Mutex<BinaryHeap<DelayedMessage>>>,
+    messages: MessageQueue,
+    pending_acks: PendingAcks,
+    delayed_messages: DelayedMessages,
 }
 
 impl Queue {
@@ -48,26 +50,31 @@ impl Queue {
     }
 
     pub fn new(name: QueueName) -> Self {
-        let pending_acks = Default::default();
-        let delayed_messages = Default::default();
-
-        let queue = Self {
+        Self {
             name,
-            messages: Default::default(),
-            pending_acks,
-            delayed_messages,
-        };
+            messages: MessageQueue::default(),
+            pending_acks: PendingAcks::default(),
+            delayed_messages: DelayedMessages::default(),
+        }
+    }
 
-        tokio::spawn(process_delayed_messages(
-            queue.messages.clone(),
-            queue.delayed_messages.clone(),
-        ));
-
-        queue
+    pub fn start(&self) {
+        let messages = self.messages.clone();
+        let delayed_messages = self.delayed_messages.clone();
+        tokio::spawn(async move {
+            process_delayed_messages(messages, delayed_messages).await;
+        });
     }
 
     pub async fn publish(&mut self, message: Message) {
         self.messages.lock().await.push_back(message);
+    }
+
+    pub async fn publish_all(&mut self, mut messages: VecDeque<Message>) {
+        if messages.is_empty() {
+            return;
+        }
+        self.messages.lock().await.append(&mut messages);
     }
 
     pub async fn publish_many(&mut self, message: Vec<Message>) {
@@ -99,7 +106,9 @@ impl Queue {
         if let Some(mut m) = self.pending_acks.remove(message_id) {
             if let Some(r) = m.retry() {
                 self.delayed_messages.lock().await.push(DelayedMessage {
-                    time: Reverse(Instant::now() + Duration::from_secs(r)),
+                    time: Reverse(
+                        (Utc::now() + Duration::from_secs(r)).timestamp(),
+                    ),
                     message: m,
                 });
             }
@@ -114,7 +123,7 @@ async fn process_delayed_messages(
     loop {
         info!("Checking delayed messages");
         while let Some(delayed_message) = delayed_messages.lock().await.pop() {
-            if Instant::now() > delayed_message.time.0 {
+            if Utc::now().timestamp() > delayed_message.time.0 {
                 messages.lock().await.push_back(delayed_message.message);
             } else {
                 break;
@@ -126,7 +135,7 @@ async fn process_delayed_messages(
 
 #[derive(Clone, Debug)]
 struct DelayedMessage {
-    time: Reverse<Instant>,
+    time: Reverse<i64>,
     message: Message,
 }
 
@@ -149,3 +158,19 @@ impl Ord for DelayedMessage {
 }
 
 impl Eq for DelayedMessage {}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{DateTime, Utc};
+
+    #[test]
+    fn name() {
+        let now = chrono::Utc::now();
+        let x = now.timestamp();
+        println!("{}", now);
+
+        let x = DateTime::from_timestamp(x, 0);
+
+        println!("{:?}", x);
+    }
+}

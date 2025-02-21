@@ -9,6 +9,7 @@ use super::{BrokerResult, Error};
 pub enum BrokerCommand {
     PublishMesage(Command<PublishMessageCommand, ()>),
     AckMessage(Command<AckMessageCommand, ()>),
+    NackMessage(Command<NackMessageCommand, ()>),
 }
 
 pub struct Command<C, O> {
@@ -45,6 +46,24 @@ impl IntoBrokerCommand for PublishMessageCommand {
 pub struct AckMessageCommand {
     pub queue_name: QueueName,
     pub message_id: MessageId,
+}
+
+pub struct NackMessageCommand {
+    pub queue_name: QueueName,
+    pub message_id: MessageId,
+}
+
+impl IntoBrokerCommand for NackMessageCommand {
+    type Output = ();
+    fn into_command(
+        self,
+        tx: Sender<BrokerResult<BrokerResponse<Self::Output>>>,
+    ) -> BrokerCommand {
+        BrokerCommand::NackMessage(Command {
+            request: self,
+            sender: tx,
+        })
+    }
 }
 
 impl IntoBrokerCommand for AckMessageCommand {

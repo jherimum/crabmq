@@ -1,9 +1,10 @@
-use std::{net::TcpListener, thread::sleep, time::Duration};
+use std::{net::TcpListener, sync::Arc};
 
 use anyhow::Result;
 use crabmq::{
     broker::{Broker, BrokerCommandBus},
     rest::RestServer,
+    storage::memory::InMemryStorage,
 };
 use tokio::select;
 
@@ -12,18 +13,19 @@ async fn main() -> Result<()> {
     dotenvy::dotenv()?;
     env_logger::init();
 
-    let broker = Broker::new();
-    let (broker, bus) = broker.run();
+    let storage = Arc::new(InMemryStorage);
+    let broker = Broker::new(storage);
+    let (broker, bus) = broker.run().await?;
 
-    let rest_server = rest_server(bus.clone());
+    //let rest_server = rest_server(bus.clone());
 
     select! {
         _ = broker => {
             log::info!("Broker stopped");
         }
-        _ = rest_server.run() => {
-            log::info!("REST server stopped");
-        }
+        // _ = rest_server.run() => {
+        //     log::info!("REST server stopped");
+        // }
 
     }
 

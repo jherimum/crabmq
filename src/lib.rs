@@ -3,3 +3,4 @@ pub mod exchange;
 pub mod message;
 pub mod queue;
 pub mod rest;
+pub mod storage;

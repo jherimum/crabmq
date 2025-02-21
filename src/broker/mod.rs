@@ -1,7 +1,7 @@
 use commands::{
-    BrokerCommand, BrokerResponse, IntoBrokerCommand, PublishMessageCommand,
+    AckMessageCommand, BrokerCommand, BrokerResponse, IntoBrokerCommand,
+    NackMessageCommand, PublishMessageCommand,
 };
-use handlers::handle_ack_message;
 use log::info;
 use tokio::{
     sync::{mpsc, oneshot, Mutex},
@@ -9,21 +9,18 @@ use tokio::{
 };
 use crate::{
     exchange::{Exchange, ExchangeName},
-    message::{Message, MessageId},
+    message::Message,
     queue::{Queue, QueueName},
+    storage::{self, Storage},
 };
 use std::{collections::HashMap, sync::Arc};
 
 pub mod commands;
-pub mod handlers;
 
 type QueueMap = HashMap<QueueName, Arc<Mutex<Queue>>>;
 type ExchangeMap = HashMap<ExchangeName, Arc<Mutex<Exchange>>>;
-type BrokerCommandSender = tokio::sync::mpsc::Sender<BrokerCommand>;
-
-type AsyncCommandSender<T> =
-    tokio::sync::oneshot::Sender<Result<BrokerResponse<T>, Error>>;
-
+type BrokerCommandSender = mpsc::Sender<BrokerCommand>;
+type AsyncCommandSender<T> = oneshot::Sender<Result<BrokerResponse<T>, Error>>;
 pub type BrokerResult<T> = Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +39,9 @@ pub enum Error {
 
     #[error("Failed to send message")]
     SendError(#[from] mpsc::error::SendError<BrokerCommand>),
+
+    #[error("Storage error: {0}")]
+    StorageError(#[from] storage::Error),
 }
 
 #[derive(Debug, Clone)]
@@ -66,14 +66,83 @@ impl BrokerCommandBus {
 pub struct Broker {
     queues: QueueMap,
     exchanges: ExchangeMap,
+    storage: Arc<dyn Storage + Send + Sync>,
 }
 
 impl Broker {
-    pub fn new() -> Self {
+    pub fn new(storage: Arc<dyn Storage + Send + Sync>) -> Self {
         Broker {
             queues: QueueMap::default(),
             exchanges: ExchangeMap::default(),
+            storage,
         }
+    }
+
+    pub async fn load(&mut self) -> BrokerResult<()> {
+        let queues = self.storage.load_queue()?;
+        let exchanges = self.storage.load_exchanges()?;
+        let bindings = self.storage.load_bindings()?;
+
+        queues.into_iter().for_each(|queue| {
+            self.queues
+                .insert(queue.name().clone(), Arc::new(Mutex::new(queue)));
+        });
+
+        exchanges.into_iter().for_each(|exchange| {
+            self.exchanges.insert(
+                exchange.name().clone(),
+                Arc::new(Mutex::new(exchange)),
+            );
+        });
+
+        for (exchange, queues) in bindings {
+            for queue in queues {
+                let _ = self.bind_queue(&exchange, &queue).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn run(
+        mut self,
+    ) -> BrokerResult<(JoinHandle<()>, BrokerCommandBus)> {
+        info!("Starting broker...");
+
+        self.load().await?;
+
+        for exchange in self.exchanges.values() {
+            exchange.lock().await.start();
+        }
+
+        for queue in self.queues.values() {
+            queue.lock().await.start();
+        }
+
+        let (tx, mut rx) = mpsc::channel(100);
+
+        let join = tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                match command {
+                    BrokerCommand::PublishMesage(envelop) => {
+                        self.handle_publish_message(
+                            envelop.request,
+                            envelop.sender,
+                        )
+                        .await;
+                    }
+                    BrokerCommand::AckMessage(envelop) => {
+                        self.handle_ack(envelop.request, envelop.sender).await;
+                    }
+
+                    BrokerCommand::NackMessage(envelop) => {
+                        self.handle_nack(envelop.request, envelop.sender).await;
+                    }
+                }
+            }
+        });
+
+        Ok((join, BrokerCommandBus { sender: tx }))
     }
 
     async fn handle_publish_message(
@@ -93,33 +162,36 @@ impl Broker {
         tx.send(response.map(|response| BrokerResponse { response }));
     }
 
-    pub fn run(self) -> (JoinHandle<()>, BrokerCommandBus) {
-        info!("Starting broker...");
-        let (tx, mut rx) = mpsc::channel(100);
+    async fn handle_ack(
+        &self,
+        request: AckMessageCommand,
+        tx: AsyncCommandSender<()>,
+    ) {
+        self.queues
+            .get(&request.queue_name)
+            .unwrap()
+            .lock()
+            .await
+            .ack(&request.message_id)
+            .await;
 
-        let join = tokio::spawn(async move {
-            while let Some(command) = rx.recv().await {
-                match command {
-                    BrokerCommand::PublishMesage(envelop) => {
-                        self.handle_publish_message(
-                            envelop.request,
-                            envelop.sender,
-                        )
-                        .await;
-                    }
-                    BrokerCommand::AckMessage(envelop) => {
-                        let response =
-                            handle_ack_message(envelop.request, &self.queues)
-                                .await;
-                        let _ = envelop.sender.send(
-                            response.map(|r| BrokerResponse { response: r }),
-                        );
-                    }
-                }
-            }
-        });
+        tx.send(Ok(BrokerResponse { response: () }));
+    }
 
-        (join, BrokerCommandBus { sender: tx })
+    async fn handle_nack(
+        &self,
+        request: NackMessageCommand,
+        tx: AsyncCommandSender<()>,
+    ) {
+        self.queues
+            .get(&request.queue_name)
+            .unwrap()
+            .lock()
+            .await
+            .nack(&request.message_id)
+            .await;
+
+        tx.send(Ok(BrokerResponse { response: () }));
     }
 
     pub fn declare_queue(&mut self, name: QueueName) {
@@ -155,19 +227,6 @@ impl Broker {
         }
     }
 
-    pub async fn publish(
-        &self,
-        exchange_name: &ExchangeName,
-        message: Message,
-    ) -> BrokerResult<()> {
-        if let Some(ex) = self.exchanges.get(exchange_name) {
-            let mut ex_guard = ex.lock().await;
-            ex_guard.publish(message.clone()).await
-        } else {
-            Err(Error::ExchangeNotFound(exchange_name.to_owned()))
-        }
-    }
-
     pub async fn consume_from_queue(
         &self,
         queue_name: &QueueName,
@@ -181,38 +240,21 @@ impl Broker {
             None => Err(Error::QueueNotFound(queue_name.to_owned())),
         }
     }
-
-    pub async fn ack(&self, queue_name: &QueueName, message_id: &MessageId) {
-        if let Some(q) = self.queues.get(queue_name) {
-            let mut q_guard = q.lock().await;
-            q_guard.ack(message_id).await;
-        }
-    }
-
-    pub async fn nack(&self, queue_name: &QueueName, message_id: &MessageId) {
-        if let Some(q) = self.queues.get(queue_name) {
-            let mut q_guard = q.lock().await;
-            q_guard.nack(message_id).await;
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::message::{Message, MessageId};
+    use std::sync::Arc;
+
+    use crate::{
+        message::{Message, MessageId},
+        storage::memory::InMemryStorage,
+    };
 
     use super::Broker;
 
     #[tokio::test]
     async fn test() {
-        let broker = Broker::new();
-
-        broker
-            .publish(
-                &"name".try_into().unwrap(),
-                Message::new(MessageId::new(), "Hello".as_bytes(), None),
-            )
-            .await
-            .unwrap();
+        let broker = Broker::new(Arc::new(InMemryStorage));
     }
 }
